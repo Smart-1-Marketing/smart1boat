@@ -8,6 +8,8 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
+
+import lead_store
 from flask import Flask, jsonify, render_template, request, send_file
 from openai import OpenAI
 
@@ -920,9 +922,15 @@ def generate_report(payload: dict) -> Any:
     return json.loads(text)
 
 
-def send_webhook(payload: dict, report: Any, status: str, report_url: str = "", report_pdf_url: str = "") -> None:
-    if not WEBHOOK_URL:
-        return
+def send_webhook(payload: dict, report: Any, status: str, report_url: str = "",
+                 report_pdf_url: str = "") -> dict:
+    """Write the lead down, then try to deliver it. Returns what happened.
+
+    The write comes first and unconditionally, so an unset webhook URL, a
+    GoHighLevel outage and a wrong URL answering 404 all leave a replayable
+    record instead of nothing. Returning the outcome rather than None is what
+    lets the caller stop telling the visitor a lead landed when it did not.
+    """
     rep = report or {}
     pkg = rep.get("recommended_package", {}) or {}
     first_name, last_name = split_name(payload.get("contact_name") or "")
@@ -949,10 +957,34 @@ def send_webhook(payload: dict, report: Any, status: str, report_url: str = "", 
         "report_pdf_url": report_pdf_url or "",
         "report_json": json.dumps(rep, separators=(",", ":"))[:60000],
     }
+    # The write-ahead copy is the body minus the generated report: the report is
+    # large, is regenerable, and is already on Cloudinary as a PDF, and it is the
+    # one field that would push a log line past the size that keeps an append
+    # from tearing. Everything a replay needs to rebuild the contact is kept.
+    row = lead_store.record({k: v for k, v in body.items() if k != "report_json"},
+                            kind=status)
+
+    if not WEBHOOK_URL:
+        lead_store.mark(row, "failed: neither GHL_WEBHOOK_URL nor SMART1_WEBHOOK_URL is set")
+        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id"),
+                "detail": "no webhook URL configured"}
     try:
-        requests.post(WEBHOOK_URL, json=body, timeout=12)
-    except requests.RequestException:
+        resp = requests.post(WEBHOOK_URL, json=body, timeout=12)
+    except requests.RequestException as exc:
         app.logger.exception("Webhook delivery failed")
+        lead_store.mark(row, f"failed: {exc.__class__.__name__}")
+        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id"),
+                "detail": exc.__class__.__name__}
+    # A 2xx is the only delivery. This used to go unchecked, so a webhook URL
+    # with a typo in it answered 404 and every lead read as delivered.
+    if resp.status_code >= 400:
+        app.logger.error("Webhook rejected the lead: HTTP %s %s",
+                         resp.status_code, (resp.text or "")[:300])
+        lead_store.mark(row, f"failed: HTTP {resp.status_code}")
+        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id"),
+                "detail": f"HTTP {resp.status_code}"}
+    lead_store.mark(row, "sent", http_status=resp.status_code)
+    return {"recorded": True, "delivered": True, "lead_id": row.get("lead_id"), "detail": ""}
 
 
 @app.get("/")
@@ -962,7 +994,28 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    """Whether this app can actually do its job, not merely whether it booted.
+
+    It used to answer {"status": "ok"} with no webhook configured -- the one
+    state in which every lead it takes is undeliverable. A probe that stays
+    green through that is a probe nobody can use to find the outage.
+    """
+    owed = len(lead_store.unsent())
+    return jsonify({
+        "status": "ok" if WEBHOOK_URL else "degraded",
+        "lead_delivery": {
+            "webhook_configured": bool(WEBHOOK_URL),
+            "mirror_configured": CLOUDINARY_READY,
+            "log": lead_store.leads_path(),
+            "owed": owed,
+        },
+        # Named rather than implied: with no webhook set, leads are still being
+        # recorded and are replayable, which is a different situation from
+        # losing them and needs saying to whoever reads this.
+        "detail": ("" if WEBHOOK_URL else
+                   "No GHL_WEBHOOK_URL or SMART1_WEBHOOK_URL is set. Leads are being "
+                   "recorded and can be replayed with replay_failed.py once one is."),
+    })
 
 
 @app.get("/api/report/<rid>")
@@ -1020,8 +1073,18 @@ def partial_lead():
             v = str(data.get(k) or "").strip()[:1500]
             if v:
                 body[k] = v
-        if WEBHOOK_URL and len(body) > 2:  # only forward if something beyond source/status arrived
-            requests.post(WEBHOOK_URL, json=body, timeout=8)
+        if len(body) <= 2:      # nothing beyond source/status arrived; nothing to keep
+            return jsonify({"ok": True})
+        row = lead_store.record(body, kind="partial", lead_id=lead_id)
+        if not WEBHOOK_URL:
+            lead_store.mark(row, "failed: neither GHL_WEBHOOK_URL nor SMART1_WEBHOOK_URL is set")
+        else:
+            resp = requests.post(WEBHOOK_URL, json=body, timeout=8)
+            if resp.status_code >= 400:
+                app.logger.error("Webhook rejected the partial lead: HTTP %s", resp.status_code)
+                lead_store.mark(row, f"failed: HTTP {resp.status_code}")
+            else:
+                lead_store.mark(row, "sent", http_status=resp.status_code)
     except Exception:
         app.logger.exception("Partial lead forward failed")
     return jsonify({"ok": True})
@@ -1056,8 +1119,17 @@ def analyze():
                     report_pdf_url = f"{base_url()}/pdf/{rid}"
             except Exception:
                 app.logger.exception("PDF generation/upload failed")
-        send_webhook(payload, report, "completed", report_url, report_pdf_url)
-        return jsonify({"ok": True, "report": report, "report_url": report_url, "report_pdf_url": report_pdf_url})
+        delivery = send_webhook(payload, report, "completed", report_url, report_pdf_url)
+        # `ok` is about the report, which really was generated and is what the
+        # visitor came for -- withholding it because our CRM is down would cost
+        # them the thing that worked. What must not happen is the response
+        # implying the lead reached the CRM when it did not, so the delivery is
+        # reported on its own terms. It is recoverable either way: the lead was
+        # written down before the POST was attempted.
+        return jsonify({"ok": True, "report": report, "report_url": report_url,
+                        "report_pdf_url": report_pdf_url,
+                        "lead_recorded": delivery.get("recorded", False),
+                        "lead_delivered": delivery.get("delivered", False)})
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception as exc:
