@@ -1007,7 +1007,14 @@ def health():
             "webhook_configured": bool(WEBHOOK_URL),
             "mirror_configured": CLOUDINARY_READY,
             "log": lead_store.leads_path(),
-            "owed": owed,
+            # Named for what it actually counts. The container's log does not
+            # survive a restart or an idle spin-down, so a bare "owed: 0" would
+            # read as "no leads outstanding" when it means "nothing outstanding
+            # since this container started" -- a different, much weaker claim.
+            "owed_local": owed,
+            "owed_note": ("counted from this container's own log, which does not survive "
+                          "a restart or an idle spin-down; run replay_failed.py "
+                          "--from-cloudinary for the durable count"),
         },
         # Named rather than implied: with no webhook set, leads are still being
         # recorded and are replayable, which is a different situation from

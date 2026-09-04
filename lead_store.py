@@ -68,7 +68,7 @@ def _data_dir() -> str:
     for candidate in (os.getenv("LEADS_DIR", "").strip(), "/var/data"):
         if candidate and os.path.isdir(candidate):
             return candidate
-    path = os.path.join(tempfile.gettempdir(), f"smart1{SOURCE_SLUG}_leads")
+    path = os.path.join(tempfile.gettempdir(), f"s1-{SOURCE_SLUG}-leads")
     try:
         os.makedirs(path, exist_ok=True)
         return path
