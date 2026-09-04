@@ -10,6 +10,7 @@ import requests
 from dotenv import load_dotenv
 
 import lead_store
+import suite_lead
 from flask import Flask, jsonify, render_template, request, send_file
 from openai import OpenAI
 
@@ -72,6 +73,28 @@ def base_url() -> str:
     if base.startswith("http://"):
         base = "https://" + base[len("http://"):]
     return base
+
+def lead_page() -> str:
+    """Which placement this lead came from, as the Hub's `page` tag.
+
+    The hostname, not the app's display name. This tool also runs inside the
+    Hub itself, so "which of the two produced this lead" is a real question
+    and the host is the only thing that answers it -- and it is short enough
+    to read as a tag in Smart 1 Suite, which a sentence is not.
+
+    PUBLIC_BASE_URL is read through `globals()` because two of these four apps
+    do not define one, and falling back to the module's own name is the answer
+    wherever there is no request either -- a lead delivered from a background
+    thread or replayed from the command line still names something.
+    """
+    base = globals().get("PUBLIC_BASE_URL") or ""
+    if not base:
+        try:
+            base = request.host_url
+        except Exception:                                 # noqa: BLE001
+            base = ""
+    host = re.sub(r"^https?://", "", str(base).strip()).strip("/").split("/")[0]
+    return host or f"smart1{lead_store.SOURCE_SLUG}"
 
 
 NAVY = (10, 34, 64)   # brand navy #0A2240
@@ -964,27 +987,44 @@ def send_webhook(payload: dict, report: Any, status: str, report_url: str = "",
     row = lead_store.record({k: v for k, v in body.items() if k != "report_json"},
                             kind=status)
 
-    if not WEBHOOK_URL:
-        lead_store.mark(row, "failed: neither GHL_WEBHOOK_URL nor SMART1_WEBHOOK_URL is set")
-        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id"),
-                "detail": "no webhook URL configured"}
-    try:
-        resp = requests.post(WEBHOOK_URL, json=body, timeout=12)
-    except requests.RequestException as exc:
-        app.logger.exception("Webhook delivery failed")
-        lead_store.mark(row, f"failed: {exc.__class__.__name__}")
-        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id"),
-                "detail": exc.__class__.__name__}
-    # A 2xx is the only delivery. This used to go unchecked, so a webhook URL
-    # with a typo in it answered 404 and every lead read as delivered.
-    if resp.status_code >= 400:
-        app.logger.error("Webhook rejected the lead: HTTP %s %s",
-                         resp.status_code, (resp.text or "")[:300])
-        lead_store.mark(row, f"failed: HTTP {resp.status_code}")
-        return {"recorded": True, "delivered": False, "lead_id": row.get("lead_id"),
-                "detail": f"HTTP {resp.status_code}"}
-    lead_store.mark(row, "sent", http_status=resp.status_code)
-    return {"recorded": True, "delivered": True, "lead_id": row.get("lead_id"), "detail": ""}
+    return deliver_lead(row, body, status)
+
+
+def deliver_lead(row: dict, body: dict, kind: str) -> dict:
+    """Hand one already-recorded lead to the Hub, and record the answer.
+
+    The Hub writes the contact over the GoHighLevel Contacts API and returns
+    the contact id, which is the thing the retired webhook could never give
+    us: a 2xx from that told us GoHighLevel had accepted a request, never that
+    a contact existed. See suite_lead.py for why there is no fallback to it.
+    """
+    res = suite_lead.deliver(
+        source=lead_store.SOURCE_SLUG,
+        page=lead_page(),
+        fields=suite_lead.lead_fields(body),
+        pdf_url=str(body.get("report_pdf_url") or ""),
+        meta=suite_lead.lead_meta(body, extra_tags=[f"report:{kind}"]),
+    )
+    if res["status"] == suite_lead.STATUS_DELIVERED:
+        lead_store.mark(row, "sent", contact_id=res["contact_id"],
+                        hub_lead_id=res["hub_lead_id"],
+                        http_status=res["http_status"])
+    elif res["status"] == suite_lead.STATUS_ACCEPTED:
+        lead_store.mark(row, "accepted", hub_lead_id=res["hub_lead_id"],
+                        http_status=res["http_status"], detail=res["detail"])
+    elif res["status"] == suite_lead.STATUS_UNDELIVERABLE:
+        lead_store.mark(row, f"undeliverable: {res['detail'][:200]}")
+    else:
+        app.logger.error("Lead not delivered to the Hub: %s", res["detail"])
+        lead_store.mark(row, f"failed: {res['detail'][:200]}",
+                        http_status=res["http_status"])
+    return {"recorded": True,
+            # Only a contact id is a delivery. The Hub having stored the lead
+            # is reported on its own terms rather than folded into this, or
+            # "delivered" goes back to meaning "somebody answered 200".
+            "delivered": res["status"] == suite_lead.STATUS_DELIVERED,
+            "accepted": res["status"] == suite_lead.STATUS_ACCEPTED,
+            "lead_id": row.get("lead_id"), "detail": res["detail"]}
 
 
 @app.get("/")
@@ -1002,9 +1042,15 @@ def health():
     """
     owed = len(lead_store.unsent())
     return jsonify({
-        "status": "ok" if WEBHOOK_URL else "degraded",
+        "status": "ok" if suite_lead.configured() else "degraded",
         "lead_delivery": {
-            "webhook_configured": bool(WEBHOOK_URL),
+            "delivery": "Smart 1 Hub -> GoHighLevel Contacts API",
+            "hub_endpoint": suite_lead.endpoint(),
+            # Not a gate: an untrusted caller is rate-limited, not
+            # refused. Reported because every lead this app sends
+            # arrives at the Hub from one address, so without it the
+            # fourth visitor of a busy hour is turned away.
+            "rate_limit_token_set": bool(suite_lead.token()),
             "mirror_configured": CLOUDINARY_READY,
             "log": lead_store.leads_path(),
             # Named for what it actually counts. The container's log does not
@@ -1012,16 +1058,27 @@ def health():
             # read as "no leads outstanding" when it means "nothing outstanding
             # since this container started" -- a different, much weaker claim.
             "owed_local": owed,
+            # Counted apart from owed, never merged with it. A lead the Hub
+            # has accepted is stored and is being retried there, so this app
+            # owes it to nobody -- and it is still not a contact, which is a
+            # different claim from "delivered" and has to read as one.
+            "accepted_by_hub": len(lead_store.accepted()),
+            # An abandoned form that never reached the contact step. Counted
+            # rather than hidden: it is a real visitor, and a number that
+            # quietly goes missing cannot be told from one nobody recorded.
+            "undeliverable_no_contact": len(lead_store.undeliverable()),
             "owed_note": ("counted from this container's own log, which does not survive "
                           "a restart or an idle spin-down; run replay_failed.py "
                           "--from-cloudinary for the durable count"),
         },
-        # Named rather than implied: with no webhook set, leads are still being
-        # recorded and are replayable, which is a different situation from
-        # losing them and needs saying to whoever reads this.
-        "detail": ("" if WEBHOOK_URL else
-                   "No GHL_WEBHOOK_URL or SMART1_WEBHOOK_URL is set. Leads are being "
-                   "recorded and can be replayed with replay_failed.py once one is."),
+        "detail": suite_lead.why_not(),
+        # Read for one reason: to say that a value is still sitting there.
+        # This app no longer posts to it -- the Hub writes the contact over
+        # the Contacts API -- so anything still firing on that URL is outside
+        # this codebase: a Suite workflow triggered by it, or a page posting
+        # straight at it. Either would write a second contact for one
+        # visitor. Turn the trigger off in Suite, then clear the variable.
+        "retired_webhook_still_set": bool(WEBHOOK_URL),
     })
 
 
@@ -1083,15 +1140,7 @@ def partial_lead():
         if len(body) <= 2:      # nothing beyond source/status arrived; nothing to keep
             return jsonify({"ok": True})
         row = lead_store.record(body, kind="partial", lead_id=lead_id)
-        if not WEBHOOK_URL:
-            lead_store.mark(row, "failed: neither GHL_WEBHOOK_URL nor SMART1_WEBHOOK_URL is set")
-        else:
-            resp = requests.post(WEBHOOK_URL, json=body, timeout=8)
-            if resp.status_code >= 400:
-                app.logger.error("Webhook rejected the partial lead: HTTP %s", resp.status_code)
-                lead_store.mark(row, f"failed: HTTP {resp.status_code}")
-            else:
-                lead_store.mark(row, "sent", http_status=resp.status_code)
+        deliver_lead(row, body, "partial")
     except Exception:
         app.logger.exception("Partial lead forward failed")
     return jsonify({"ok": True})
